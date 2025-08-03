@@ -4,6 +4,6 @@
 #include <lvgl.h>
 
 void screen2_init(void);
-lv_obj_t * screen2_get(void);
+lv_obj_t* screen2_get(void);
 
 #endif // SCREEN2_H

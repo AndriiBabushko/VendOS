@@ -98,3 +98,22 @@ if(APPLE OR UNIX)
             INSTALL_RPATH "${SONY_SDK_STAGE}/external/crsdk"
     )
 endif()
+
+find_program(CLANG_FORMAT NAMES clang-format clang-format-15)
+if(CLANG_FORMAT)
+    file(GLOB_RECURSE ALL_C_FILES
+            "${CMAKE_SOURCE_DIR}/src/*.c"
+            "${CMAKE_SOURCE_DIR}/src/*.h"
+    )
+    add_custom_target(
+            format
+            COMMAND ${CLANG_FORMAT}
+            -i
+            --style=file
+            ${ALL_C_FILES}
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            COMMENT "Formatting C/C++ files depending on rules from .clang-format"
+    )
+else()
+    message(WARNING "clang-format not found — target format will not be available")
+endif()
