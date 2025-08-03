@@ -3,6 +3,7 @@
 
 #include <lvgl.h>
 
-lv_obj_t * screen1_create(void);
+void screen1_init(void);
+lv_obj_t * screen1_get(void);
 
 #endif // SCREEN1_H
