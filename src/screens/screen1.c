@@ -6,6 +6,7 @@
 static lv_obj_t* scr1 = NULL;
 static lv_obj_t* btn1 = NULL;
 static bool busy1 = false;
+static lv_display_t * g_disp;
 
 static void btn1_cb(lv_event_t* e);
 static void unlock_timer_cb(lv_timer_t* t);
@@ -15,6 +16,7 @@ void screen1_init(void) {
         return;
     scr1 = lv_obj_create(NULL);
 
+    lv_sdl_window_set_title(g_disp, "Screen 1");
     btn1 = lv_btn_create(scr1);
     lv_obj_center(btn1);
 
@@ -37,6 +39,7 @@ static void btn1_cb(lv_event_t* e) {
     }
 
     lv_scr_load(screen2_get());
+    lv_sdl_window_set_title(g_disp, "Screen 2");
 
     lv_timer_t* t = lv_timer_create(unlock_timer_cb, 100, &busy1);
     (void)t;
