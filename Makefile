@@ -5,9 +5,7 @@ CLANG_FORMAT := clang-format
 
 SRC_FILES := $(shell find src -type f \( -name "*.c" -o -name "*.h" \))
 
-.PHONY: all build format run clean
-
-all: build
+.PHONY: build format run clean
 
 build:
 	@echo "==> Creating build directory and run CMake+Ninja"
