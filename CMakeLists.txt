@@ -68,9 +68,17 @@ endif()
 file(GLOB APP_SRCS
         src/main.c
         src/screens/*.c
+        src/print/*.c
 )
 
 add_executable(vending_app ${APP_SRCS})
+
+find_library(CUPS_LIB cups)
+if (CUPS_LIB)
+    target_link_libraries(vending_app PRIVATE ${CUPS_LIB})
+else()
+    target_link_libraries(vending_app PRIVATE cups)
+endif()
 
 if(APPLE)
     add_dependencies(vending_app patch_crsdk)
