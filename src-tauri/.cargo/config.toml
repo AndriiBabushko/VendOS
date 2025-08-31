@@ -1,5 +1,16 @@
+# macOS
+[target.aarch64-apple-darwin]
+rustflags = ["-C","link-args=-Wl,-rpath,@executable_path/../.."]
+
 [target.x86_64-apple-darwin]
 rustflags = ["-C","link-args=-Wl,-rpath,@executable_path/../.."]
 
-[target.aarch64-apple-darwin]
-rustflags = ["-C","link-args=-Wl,-rpath,@executable_path/../.."]
+# Linux
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C","link-args=-Wl,-rpath,$ORIGIN/../.."]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C","link-args=-Wl,-rpath,$ORIGIN/../.."]
+
+[target.armv7-unknown-linux-gnueabihf]
+rustflags = ["-C","link-args=-Wl,-rpath,$ORIGIN/../.."]

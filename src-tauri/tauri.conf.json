@@ -26,7 +26,22 @@
     "resources": [
       "libs/macos/libCr_Core.dylib",
       "libs/macos/libmonitor_protocol.dylib",
-      "libs/macos/libmonitor_protocol_pf.dylib"
+      "libs/macos/libmonitor_protocol_pf.dylib",
+
+      "libs/windows/x64/Cr_Core.dll",
+      "libs/windows/x64/monitor_protocol.dll",
+      "libs/windows/x64/monitor_protocol_pf.dll",
+
+      "libs/linux/x86_64/libCr_Core.so",
+      "libs/linux/x86_64/libmonitor_protocol.so",
+      "libs/linux/x86_64/libmonitor_protocol_pf.so",
+      "libs/linux/aarch64/libCr_Core.so",
+      "libs/linux/aarch64/libmonitor_protocol.so",
+      "libs/linux/aarch64/libmonitor_protocol_pf.so",
+      "libs/linux/armv7/libCr_Core.so",
+      "libs/linux/armv7/libmonitor_protocol.so",
+      "libs/linux/armv7/libmonitor_protocol_pf.so"
     ]
+
   }
 }
