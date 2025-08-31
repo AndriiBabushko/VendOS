@@ -1,0 +1,57 @@
+name: build-macos
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # macos-14 = Apple Silicon (ARM64). Якщо твої dylib під Intel, постав macos-13.
+    runs-on: macos-14
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri
+
+      - name: Install frontend deps
+        run: npm ci
+
+      # білд Tauri (release). --ci вимикає підпис/нотаризацію.
+      - name: Build Tauri app (release)
+        run: npm run tauri build -- --ci
+
+      # опціональний смоук-тест: просто перевіряємо, що динаміки підтягуються і код лінкується/раниться
+      - name: Unit tests (no camera required)
+        env:
+          # щоб тести гарантовано побачили .dylib (ми ще й копіюємо їх у target/debug у build.rs)
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/src-tauri/target/debug
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml -p vend-os --no-default-features -- --nocapture
+
+      # забираємо .dmg/.app
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendos-macos-artifacts
+          path: |
+            src-tauri/target/release/bundle/**
+          if-no-files-found: warn

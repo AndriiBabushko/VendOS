@@ -1,0 +1,31 @@
+name: build-windows
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+          profile: minimal
+          override: true
+
+      - name: Install WebView2 runtime (for running tests that might spawn webview)
+        run: |
+          powershell -Command "Invoke-WebRequest https://go.microsoft.com/fwlink/p/?LinkId=2124703 -OutFile MicrosoftEdgeWebView2Setup.exe"
+          .\MicrosoftEdgeWebView2Setup.exe /install /silent || exit 0
+
+      - name: NPM install
+        run: npm ci
+
+      - name: Build (no sign)
+        run: npm run tauri build -- --ci
+
+      - name: Run unit tests (no camera required)
+        run: cargo test -p vend-os --no-default-features
