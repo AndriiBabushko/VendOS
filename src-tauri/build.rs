@@ -1,105 +1,51 @@
-use std::{env, fs, path::PathBuf};
-
 fn main() {
-    tauri_build::build();
+    // rebuild triggers
+    println!("cargo:rerun-if-changed=src/sony_bridge.rs");
+    println!("cargo:rerun-if-changed=cpp/sony_bridge.cc");
+    println!("cargo:rerun-if-changed=cpp/sony_bridge.hpp");
+    println!("cargo:rerun-if-changed=libs/include");
+    println!("cargo:rerun-if-changed=libs/macos");
 
-    let target_os   = env::var("CARGO_CFG_TARGET_OS").unwrap();
-    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
-
-    // CXX міст
-    let mut bridge = cxx_build::bridge("src/sony_bridge.rs");
-    if target_os == "windows" {
-        bridge.flag_if_supported("/std:c++17")
-            .flag_if_supported("/Zc:__cplusplus")
-            .flag_if_supported("/W3");
-    } else {
-        bridge.flag_if_supported("-std=c++17")
-            .flag_if_supported("-Wno-unused-parameter")
-            .flag_if_supported("-Wno-unknown-pragmas");
-    }
-    bridge
-        .include(".")
+    // cxx bridge
+    let mut b = cxx_build::bridge("src/sony_bridge.rs");
+    b.file("cpp/sony_bridge.cc")
+        .include("cpp")
         .include("libs/include")
-        .file("cpp/sony_bridge.cc");
-    bridge.compile("sony_bridge");
+        .flag_if_supported("-std=c++17")
+        .flag_if_supported("-Wno-unused-parameter")
+        .flag_if_supported("-Wno-unknown-pragmas");
 
-    // Куди копіювати динаміки для dev
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let bin_dir = out_dir.join("../../../"); // target/{debug|release}
+    #[cfg(target_os = "macos")]
+    {
+        // мінімалка системи (звично ок)
+        b.flag_if_supported("-mmacosx-version-min=11.0");
+    }
 
-    match (target_os.as_str(), target_arch.as_str()) {
-        // --- macOS ---
-        ("macos", _) => {
-            println!("cargo:rustc-link-search=native=libs/macos");
-            println!("cargo:rustc-link-lib=dylib=Cr_Core");
-            println!("cargo:rustc-link-lib=dylib=monitor_protocol");
-            println!("cargo:rustc-link-lib=dylib=monitor_protocol_pf");
-            println!("cargo:rustc-link-lib=dylib=c++");
+    b.compile("vend-os-cxxbridge");
 
-            for name in ["libCr_Core.dylib","libmonitor_protocol.dylib","libmonitor_protocol_pf.dylib"] {
-                let _ = fs::copy(PathBuf::from("libs/macos").join(name), bin_dir.join(name));
-            }
-        }
+    // ===== dev-шляхи до CRSDK (пробросимо в код як константи) =====
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let dev_libs = format!("{}/libs/macos", manifest_dir);
+    let dev_adapter = format!("{}/libs/macos/CrAdapter", manifest_dir);
 
-        // --- Windows x64 ---
-        ("windows", "x86_64") => {
-            println!("cargo:rustc-link-search=native=libs/windows/x64");
-            // Потрібен лише цей .lib:
-            println!("cargo:rustc-link-lib=dylib=Cr_Core");
+    println!("cargo:rustc-env=CRSDK_DEV_LIBS={dev_libs}");
+    println!("cargo:rustc-env=CRSDK_DEV_ADAPTER={dev_adapter}");
 
-            // Рантайм DLL, які мусять лежати біля .exe:
-            for name in [
-                "Cr_Core.dll",
-                "monitor_protocol.dll",
-                "monitor_protocol_pf.dll",
-                "Cr_PTP_USB.dll",
-                "Cr_PTP_IP.dll",
-                "libusb-1.0.dll",
-                "libssh2.dll",
-            ] {
-                let _ = fs::copy(PathBuf::from("libs/windows/x64").join(name), bin_dir.join(name));
-            }
-        }
+    // !!! для C++ макросів треба &str і одразу в лапках:
+    let dev_libs_macro = format!(r#""{}""#, dev_libs);
+    let dev_adapter_macro = format!(r#""{}""#, dev_adapter);
 
-        // --- Linux x86_64 ---
-        ("linux", "x86_64") => {
-            println!("cargo:rustc-link-search=native=libs/linux/x86_64");
-            println!("cargo:rustc-link-lib=dylib=Cr_Core");
-            println!("cargo:rustc-link-lib=dylib=monitor_protocol");
-            println!("cargo:rustc-link-lib=dylib=monitor_protocol_pf");
-            println!("cargo:rustc-link-lib=dylib=stdc++");
+    b.define("CRSDK_DEV_LIBS",     Some(dev_libs_macro.as_str()));
+    b.define("CRSDK_DEV_ADAPTER",  Some(dev_adapter_macro.as_str()));
 
-            for name in ["libCr_Core.so","libmonitor_protocol.so","libmonitor_protocol_pf.so"] {
-                let _ = fs::copy(PathBuf::from("libs/linux/x86_64").join(name), bin_dir.join(name));
-            }
-        }
+    // ===== link CRSDK (macOS) =====
+    #[cfg(target_os = "macos")]
+    {
+        println!("cargo:rustc-link-search=native=libs/macos");
+        println!("cargo:rustc-link-search=native=libs/macos/CrAdapter");
 
-        // --- Linux aarch64 (ARMv8) ---
-        ("linux", "aarch64") => {
-            println!("cargo:rustc-link-search=native=libs/linux/aarch64");
-            println!("cargo:rustc-link-lib=dylib=Cr_Core");
-            println!("cargo:rustc-link-lib=dylib=monitor_protocol");
-            println!("cargo:rustc-link-lib=dylib=monitor_protocol_pf");
-            println!("cargo:rustc-link-lib=dylib=stdc++");
-
-            for name in ["libCr_Core.so","libmonitor_protocol.so","libmonitor_protocol_pf.so"] {
-                let _ = fs::copy(PathBuf::from("libs/linux/aarch64").join(name), bin_dir.join(name));
-            }
-        }
-
-        // --- Linux ARMv7 (arm) ---
-        ("linux", "arm") => {
-            println!("cargo:rustc-link-search=native=libs/linux/armv7");
-            println!("cargo:rustc-link-lib=dylib=Cr_Core");
-            println!("cargo:rustc-link-lib=dylib=monitor_protocol");
-            println!("cargo:rustc-link-lib=dylib=monitor_protocol_pf");
-            println!("cargo:rustc-link-lib=dylib=stdc++");
-
-            for name in ["libCr_Core.so","libmonitor_protocol.so","libmonitor_protocol_pf.so"] {
-                let _ = fs::copy(PathBuf::from("libs/linux/armv7").join(name), bin_dir.join(name));
-            }
-        }
-
-        _ => {}
+        println!("cargo:rustc-link-lib=dylib=Cr_Core");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../..");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path");
     }
 }

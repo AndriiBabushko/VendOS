@@ -1,33 +1,33 @@
+#![allow(non_snake_case)]
+
 #[cxx::bridge]
 mod ffi {
-    // УВАГА: шлях відносно кореня crate (src-tauri/)
+    // include без "cpp/" — build.rs додає include("cpp")
     unsafe extern "C++" {
-        include!("cpp/sony_bridge.hpp");
+        include!("sony_bridge.hpp");
 
-        #[namespace = "sony"]
-        fn crsdk_init() -> bool;
+        // базове
+        #[namespace = "sony"] fn crsdk_init() -> bool;
+        #[namespace = "sony"] fn crsdk_release();
+        #[namespace = "sony"] fn crsdk_is_connected() -> bool;
 
-        #[namespace = "sony"]
-        fn crsdk_release();
+        // під’єднання / енумерація
+        #[namespace = "sony"] fn crsdk_connect_first_usb() -> bool;
+        #[namespace = "sony"] fn crsdk_enum_refresh() -> bool;
+        #[namespace = "sony"] fn crsdk_enum_count() -> u32;
+        #[namespace = "sony"] fn crsdk_enum_model(i: u32) -> String;
+        #[namespace = "sony"] fn crsdk_connect_index(i: u32) -> i32;
 
-        #[namespace = "sony"]
-        fn crsdk_connect_first_usb() -> bool;
+        // збереження / кадри
+        #[namespace = "sony"] fn crsdk_set_save_dir(path: &str) -> bool;
+        #[namespace = "sony"] fn crsdk_capture_blocking(timeout_ms: u32) -> String;
+        #[namespace = "sony"] fn crsdk_liveview_frame() -> Vec<u8>;
 
-        // cxx підтримує &str як read-only rust::Str на боці C++
-        #[namespace = "sony"]
-        fn crsdk_set_save_dir(path: &str) -> bool;
+        // діагностика
+        #[namespace = "sony"] fn crsdk_last_error() -> i32;
+        #[namespace = "sony"] fn crsdk_last_error_text() -> String;
 
-        /// Робить кадр і повертає абсолютний шлях до збереженого файлу.
-        /// Порожній рядок = помилка/таймаут.
-        #[namespace = "sony"]
-        fn crsdk_capture_blocking(timeout_ms: u32) -> String;
-
-        /// JPEG кадр live-view (порожній — якщо нема)
-        #[namespace = "sony"]
-        fn crsdk_liveview_frame() -> Vec<u8>;
-
-        #[namespace = "sony"]
-        fn crsdk_is_connected() -> bool;
+        #[namespace = "sony"] fn crsdk_version_raw() -> u32;
     }
 }
 

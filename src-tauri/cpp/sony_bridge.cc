@@ -1,5 +1,6 @@
 #include "sony_bridge.hpp"
 
+// Sony CRSDK (umbrella + потрібні типи)
 #include <CRSDK/CameraRemote_SDK.h>
 #include <CRSDK/IDeviceCallback.h>
 #include <CRSDK/ICrCameraObjectInfo.h>
@@ -8,31 +9,34 @@
 #include <CRSDK/CrDefines.h>
 #include <CRSDK/CrTypes.h>
 
+// std
 #include <atomic>
-#include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
-#include <memory>   // <- додали
 
 using namespace SCRSDK;
 
 namespace {
-  class DeviceCallback final : public IDeviceCallback {
-  public:
-    // !!! У ВИЗНАЧЕННІ ХЕДЕРІВ ТИП НАЗИВАЄТЬСЯ DeviceConnectionVersioin (з помилкою)
+
+// --- Callback ---
+class DeviceCallback final : public IDeviceCallback {
+public:
+    // у деяких версіях хедерів назва з опечаткою: DeviceConnectionVersioin
     void OnConnected(DeviceConnectionVersioin) override { is_connected.store(true); }
     void OnDisconnected(CrInt32u) override { is_connected.store(false); }
+
     void OnCompleteDownload(CrChar* filename, CrInt32u = 0xFFFFFFFF) override {
-      if (!filename) return;
-      std::lock_guard<std::mutex> lock(mutex_download);
-      last_downloaded_path = filename;
-      has_new_file = true;
-      cv_download.notify_all();
+        if (!filename) return;
+        std::lock_guard<std::mutex> lk(mx);
+        last_downloaded_path = filename;
+        has_new = true;
+        cv.notify_all();
     }
 
-    // інші події нам не потрібні
     void OnPropertyChanged() override {}
     void OnLvPropertyChanged() override {}
     void OnWarning(CrInt32u) override {}
@@ -41,105 +45,206 @@ namespace {
     void OnLvPropertyChangedCodes(CrInt32u, CrInt32u*) override {}
     void OnNotifyContentsTransfer(CrInt32u, CrContentHandle, CrChar*) override {}
 
-    bool wait_for_photo(unsigned timeout_ms, std::string& out_path) {
-      std::unique_lock<std::mutex> lock(mutex_download);
-      if (!cv_download.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&]{ return has_new_file; })) {
-        return false;
-      }
-      out_path = last_downloaded_path;
-      has_new_file = false;
-      return true;
+    bool wait_for_photo(unsigned timeout_ms, std::string& out) {
+        std::unique_lock<std::mutex> lk(mx);
+        if (!cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&]{ return has_new; })) {
+            return false;
+        }
+        out = last_downloaded_path;
+        has_new = false;
+        return true;
     }
 
     std::atomic<bool> is_connected{false};
 
-  private:
-    std::mutex mutex_download;
-    std::condition_variable cv_download;
+private:
+    std::mutex mx;
+    std::condition_variable cv;
     std::string last_downloaded_path;
-    bool has_new_file{false};
-  };
+    bool has_new{false};
+};
 
-  DeviceCallback g_callback;
-  CrDeviceHandle g_device = 0;
+// --- глобальний стан ---
+DeviceCallback g_cb;
+CrDeviceHandle g_dev = 0;
 
-  // live-view тимчасові буфери
-  std::unique_ptr<CrImageDataBlock> g_image_block;
-  std::vector<uint8_t> g_tmp_buffer;
-}
+// Тримаємо енумератор живим, щоб ICrCameraObjectInfo* лишались валідними
+ICrEnumCameraObjectInfo* g_enum = nullptr;
+std::vector<const ICrCameraObjectInfo*> g_list;
+
+// Live-view буфери
+std::unique_ptr<CrImageDataBlock> g_img_blk;
+std::vector<std::uint8_t> g_tmp;
+
+// наш останній код помилки (0 == CrError_None)
+std::atomic<int> g_last_err{0};
+
+} // namespace
 
 namespace sony {
 
+// ====== БАЗА ======
 bool crsdk_init() {
-  return SCRSDK::Init(0);
+    g_last_err = 0;
+    bool ok = SCRSDK::Init(0);
+    if (!ok) g_last_err = -1001; // Init failed (bool)
+    return ok;
 }
 
 void crsdk_release() {
-  if (g_device) {
-    SCRSDK::Disconnect(g_device);
-    g_device = 0;
-  }
-  SCRSDK::Release();
+    if (g_dev) {
+        SCRSDK::Disconnect(g_dev);
+        g_dev = 0;
+    }
+    if (g_enum) { g_enum->Release(); g_enum = nullptr; }
+    SCRSDK::Release();
+    g_last_err = 0;
 }
 
 bool crsdk_is_connected() {
-  return g_callback.is_connected.load();
+    return g_cb.is_connected.load();
 }
 
+// ====== ПІД’ЄДНАННЯ ======
 bool crsdk_connect_first_usb() {
-  ICrEnumCameraObjectInfo* enumerator = nullptr;
-  if (SCRSDK::EnumCameraObjects(&enumerator) != CrError_None || !enumerator) return false;
+    g_last_err = 0;
+    ICrEnumCameraObjectInfo* e = nullptr;
+    CrError err = SCRSDK::EnumCameraObjects(&e);
+    if (err != CrError_None || !e) { g_last_err = (int)err; return false; }
 
-  // повертається const*
-  const ICrCameraObjectInfo* camera_info_const = enumerator->GetCameraObjectInfo(0);
-  if (!camera_info_const) { enumerator->Release(); return false; }
-
-  // Connect у більшості версій приймає не-const → робимо safe const_cast
-  bool ok = (SCRSDK::Connect(const_cast<ICrCameraObjectInfo*>(camera_info_const),
-                             &g_callback, &g_device, CrSdkControlMode_RemoteTransfer) == CrError_None);
-  enumerator->Release();
-  return ok;
+    const ICrCameraObjectInfo* info = e->GetCameraObjectInfo(0);
+    bool ok = false;
+    if (info) {
+        err = SCRSDK::Connect(const_cast<ICrCameraObjectInfo*>(info),
+                              &g_cb, &g_dev, CrSdkControlMode_RemoteTransfer);
+        g_last_err = (int)err;
+        ok = (err == CrError_None);
+    }
+    e->Release();
+    return ok;
 }
 
-bool crsdk_set_save_dir(rust::Str path) {
-  if (!g_device) return false;
-  return SCRSDK::SetSaveInfo(g_device, (CrChar*)path.data(), (CrChar*)"", -1) == CrError_None;
+// --- перелік камер (простий цикл, без GetCount()) ---
+bool crsdk_enum_refresh() {
+    g_last_err = 0;
+    if (g_enum) { g_enum->Release(); g_enum = nullptr; }
+    g_list.clear();
+
+    CrError err = SCRSDK::EnumCameraObjects(&g_enum);
+    if (err != CrError_None || !g_enum) { g_last_err = (int)err; return false; }
+
+    for (CrInt32u i = 0;; ++i) {
+        const ICrCameraObjectInfo* info = g_enum->GetCameraObjectInfo(i);
+        if (!info) break;
+        g_list.push_back(info);
+    }
+    return true;
 }
 
-rust::String crsdk_capture_blocking(uint32_t timeout_ms) {
-  if (!g_device) return rust::String();
-
-  SCRSDK::SendCommand(g_device, CrCommandId_Release, CrCommandParam_Down);
-  SCRSDK::SendCommand(g_device, CrCommandId_Release, CrCommandParam_Up);
-
-  std::string saved_path;
-  if (!g_callback.wait_for_photo(timeout_ms, saved_path)) return rust::String();
-  return rust::String(saved_path);
+std::uint32_t crsdk_enum_count() {
+    return static_cast<std::uint32_t>(g_list.size());
 }
 
-rust::Vec<uint8_t> crsdk_liveview_frame() {
-  rust::Vec<uint8_t> result;
-  if (!g_device) return result;
+rust::String crsdk_enum_model(std::uint32_t i) {
+    if (i >= g_list.size() || !g_list[i]) return rust::String();
 
-  CrImageInfo info;
-  if (SCRSDK::GetLiveViewImageInfo(g_device, &info) != CrError_None) return result;
-
-  if (!g_image_block) g_image_block.reset(new CrImageDataBlock());
-  g_image_block->SetSize(info.GetBufferSize());
-
-  if (g_tmp_buffer.size() < info.GetBufferSize())
-    g_tmp_buffer.resize(info.GetBufferSize());
-
-  g_image_block->SetData(g_tmp_buffer.data());
-
-  if (SCRSDK::GetLiveViewImage(g_device, g_image_block.get()) != CrError_None) return result;
-
-  uint32_t image_size = g_image_block->GetImageSize();
-  result.reserve(image_size);
-  for (uint32_t i = 0; i < image_size; ++i) {
-    result.push_back(g_image_block->GetImageData()[i]);
-  }
-  return result; // JPEG
+    const CrChar* name = g_list[i]->GetModel();
+#ifdef _WIN32
+    const wchar_t* w = reinterpret_cast<const wchar_t*>(name);
+    if (!w) return rust::String();
+    int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 1) return rust::String();
+    std::string utf8(len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, &utf8[0], len, nullptr, nullptr);
+    return rust::String(utf8);
+#else
+    return rust::String(name ? name : "");
+#endif
 }
+
+std::int32_t crsdk_connect_index(std::uint32_t i) {
+    if (i >= g_list.size() || !g_list[i]) { g_last_err = -2; return -1; } // bad index
+    if (g_dev) { SCRSDK::Disconnect(g_dev); g_dev = 0; }
+
+    CrError err = SCRSDK::Connect(const_cast<ICrCameraObjectInfo*>(g_list[i]),
+                                  &g_cb, &g_dev, CrSdkControlMode_RemoteTransfer);
+    g_last_err = (int)err;
+    return (int)err; // 0 == CrError_None
+}
+
+// ====== НАЛАШТУВАННЯ/КАДРИ ======
+bool crsdk_set_save_dir(rust::Str path_utf8) {
+    if (!g_dev) { g_last_err = -3; return false; } // not connected
+    CrError err = SCRSDK::SetSaveInfo(g_dev,
+                                      (CrChar*)path_utf8.data(),
+                                      (CrChar*)"", -1);
+    g_last_err = (int)err;
+    return (err == CrError_None);
+}
+
+rust::String crsdk_capture_blocking(std::uint32_t timeout_ms) {
+    if (!g_dev) { g_last_err = -3; return rust::String(); } // not connected
+
+    SCRSDK::SendCommand(g_dev, CrCommandId_Release, CrCommandParam_Down);
+    SCRSDK::SendCommand(g_dev, CrCommandId_Release, CrCommandParam_Up);
+
+    std::string saved;
+    if (!g_cb.wait_for_photo(timeout_ms, saved)) { g_last_err = -110; return rust::String(); }
+    g_last_err = 0;
+    return rust::String(saved);
+}
+
+rust::Vec<std::uint8_t> crsdk_liveview_frame() {
+    rust::Vec<std::uint8_t> out;
+    if (!g_dev) { g_last_err = -3; return out; } // not connected
+
+    CrImageInfo info;
+    CrError err = SCRSDK::GetLiveViewImageInfo(g_dev, &info);
+    if (err != CrError_None) { g_last_err = (int)err; return out; }
+
+    if (!g_img_blk) g_img_blk.reset(new CrImageDataBlock());
+    auto size = info.GetBufferSize();
+    g_img_blk->SetSize(size);
+
+    if (g_tmp.size() < size) g_tmp.resize(size);
+    g_img_blk->SetData(g_tmp.data());
+
+    err = SCRSDK::GetLiveViewImage(g_dev, g_img_blk.get());
+    if (err != CrError_None) { g_last_err = (int)err; return out; }
+
+    std::uint32_t img_sz = g_img_blk->GetImageSize();
+    out.reserve(img_sz);
+    const CrInt8u* p = g_img_blk->GetImageData();
+    for (std::uint32_t i = 0; i < img_sz; ++i) out.push_back(p[i]);
+    g_last_err = 0;
+    return out;
+}
+
+// ====== ДІАГНОСТИКА ======
+std::int32_t crsdk_last_error() {
+    return g_last_err.load();
+}
+
+static std::string last_error_text_impl(int code) {
+    if (code == 0) return "CrError_None";
+    switch (code) {
+        case -1001: return "Init failed";
+        case -2:    return "Invalid device index";
+        case -3:    return "Not connected";
+        case -110:  return "Capture timeout";
+        default:    break;
+    }
+    return std::string("CrError code ") + std::to_string(code);
+}
+
+rust::String crsdk_last_error_text() {
+    return rust::String(last_error_text_impl(g_last_err.load()));
+}
+
+std::uint32_t crsdk_version_raw() {
+    // CRSDK повертає номер версії як ціле (наприклад 11400 == 1.14.00)
+    return SCRSDK::GetSDKVersion();
+}
+
 
 } // namespace sony
