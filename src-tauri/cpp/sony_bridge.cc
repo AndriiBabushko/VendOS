@@ -1,6 +1,6 @@
 #include "sony_bridge.hpp"
 
-// Sony CRSDK (umbrella + потрібні типи)
+// Sony CRSDK
 #include <CRSDK/CameraRemote_SDK.h>
 #include <CRSDK/IDeviceCallback.h>
 #include <CRSDK/ICrCameraObjectInfo.h>
@@ -17,6 +17,12 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <cstring>
+#include <filesystem>
+#include <unistd.h>     // getcwd, chdir
+#include <sys/stat.h>   // stat
+#include <cstdlib>      // setenv
+#include <dlfcn.h>
 
 using namespace SCRSDK;
 
@@ -25,7 +31,6 @@ namespace {
 // --- Callback ---
 class DeviceCallback final : public IDeviceCallback {
 public:
-    // у деяких версіях хедерів назва з опечаткою: DeviceConnectionVersioin
     void OnConnected(DeviceConnectionVersioin) override { is_connected.store(true); }
     void OnDisconnected(CrInt32u) override { is_connected.store(false); }
 
@@ -37,6 +42,7 @@ public:
         cv.notify_all();
     }
 
+    // інше нам не треба
     void OnPropertyChanged() override {}
     void OnLvPropertyChanged() override {}
     void OnWarning(CrInt32u) override {}
@@ -79,15 +85,72 @@ std::vector<std::uint8_t> g_tmp;
 // наш останній код помилки (0 == CrError_None)
 std::atomic<int> g_last_err{0};
 
-} // namespace
+} // ns
 
 namespace sony {
 
+static std::string g_saved_cwd;
 // ====== БАЗА ======
+static bool dir_exists(const std::string& p) {
+    struct stat st{}; return ::stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+static void prepend_env(const char* key, const std::string& val) {
+    if (val.empty()) return;
+    const char* cur = std::getenv(key);
+    if (cur && *cur) {
+        std::string s = val; s += ":"; s += cur; ::setenv(key, s.c_str(), 1);
+    } else {
+        ::setenv(key, val.c_str(), 1);
+    }
+}
+
+static void* must_load(const char* name) {
+  void* h = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
+  if (!h) fprintf(stderr, "dlopen('%s') failed: %s\n", name, dlerror());
+  else    fprintf(stderr, "loaded %s\n", name);
+  return h;
+}
+
 bool crsdk_init() {
     g_last_err = 0;
+
+    // запам’ятати CWD, бо будемо тимчасово заходити в папку з .so
+    char cwd_buf[4096]{0};
+    std::string saved;
+    if (::getcwd(cwd_buf, sizeof(cwd_buf))) saved = cwd_buf;
+
+    // libs/linux/<arch> де є підпапка CrAdapter
+    std::string archdir =
+    #if defined(__x86_64__)
+        "x86_64";
+    #elif defined(__aarch64__)
+        "aarch64";
+    #elif defined(__arm__)
+        "armv7";
+    #else
+        "";
+    #endif
+
+    std::string base = "libs/linux";
+    std::string dir  = archdir.empty() ? base : (base + "/" + archdir);
+    std::string adapter = dir + "/CrAdapter";
+
+    if (::getcwd(cwd_buf, sizeof(cwd_buf))) g_saved_cwd = cwd_buf;
+
+    // лишаємо CWD В КАТАЛОЗІ libs
+    if (dir_exists(adapter))           ::chdir(dir.c_str());
+    else if (dir_exists(base+"/CrAdapter")) ::chdir(base.c_str());
+
+    prepend_env("LD_LIBRARY_PATH", dir + ":" + adapter);
+
+    must_load("libCr_Core.so");
+    must_load("libmonitor_protocol_pf.so");
+    must_load("libmonitor_protocol.so");
+    must_load("libCr_PTP_USB.so");
+    must_load("libCr_PTP_IP.so");
+
     bool ok = SCRSDK::Init(0);
-    if (!ok) g_last_err = -1001; // Init failed (bool)
+    if (!ok) g_last_err = -1001;
     return ok;
 }
 
@@ -98,40 +161,21 @@ void crsdk_release() {
     }
     if (g_enum) { g_enum->Release(); g_enum = nullptr; }
     SCRSDK::Release();
-    g_last_err = 0;
+    if (!g_saved_cwd.empty()) ::chdir(g_saved_cwd.c_str());
 }
 
 bool crsdk_is_connected() {
     return g_cb.is_connected.load();
 }
 
-// ====== ПІД’ЄДНАННЯ ======
-bool crsdk_connect_first_usb() {
-    g_last_err = 0;
-    ICrEnumCameraObjectInfo* e = nullptr;
-    CrError err = SCRSDK::EnumCameraObjects(&e);
-    if (err != CrError_None || !e) { g_last_err = (int)err; return false; }
-
-    const ICrCameraObjectInfo* info = e->GetCameraObjectInfo(0);
-    bool ok = false;
-    if (info) {
-        err = SCRSDK::Connect(const_cast<ICrCameraObjectInfo*>(info),
-                              &g_cb, &g_dev, CrSdkControlMode_RemoteTransfer);
-        g_last_err = (int)err;
-        ok = (err == CrError_None);
-    }
-    e->Release();
-    return ok;
-}
-
-// --- перелік камер (простий цикл, без GetCount()) ---
+// ====== ПІД’ЄДНАННЯ/ЕНУМЕРАЦІЯ ======
 bool crsdk_enum_refresh() {
     g_last_err = 0;
     if (g_enum) { g_enum->Release(); g_enum = nullptr; }
     g_list.clear();
 
     CrError err = SCRSDK::EnumCameraObjects(&g_enum);
-    if (err != CrError_None || !g_enum) { g_last_err = (int)err; return false; }
+    if (err != CrError_None || !g_enum) { g_last_err = (int)err ? (int)err : -1; return false; }
 
     for (CrInt32u i = 0;; ++i) {
         const ICrCameraObjectInfo* info = g_enum->GetCameraObjectInfo(i);
@@ -147,19 +191,8 @@ std::uint32_t crsdk_enum_count() {
 
 rust::String crsdk_enum_model(std::uint32_t i) {
     if (i >= g_list.size() || !g_list[i]) return rust::String();
-
     const CrChar* name = g_list[i]->GetModel();
-#ifdef _WIN32
-    const wchar_t* w = reinterpret_cast<const wchar_t*>(name);
-    if (!w) return rust::String();
-    int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 1) return rust::String();
-    std::string utf8(len - 1, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, &utf8[0], len, nullptr, nullptr);
-    return rust::String(utf8);
-#else
     return rust::String(name ? name : "");
-#endif
 }
 
 std::int32_t crsdk_connect_index(std::uint32_t i) {
@@ -172,7 +205,13 @@ std::int32_t crsdk_connect_index(std::uint32_t i) {
     return (int)err; // 0 == CrError_None
 }
 
-// ====== НАЛАШТУВАННЯ/КАДРИ ======
+bool crsdk_connect_first_usb() {
+    if (!crsdk_enum_refresh()) return false;
+    if (crsdk_enum_count() == 0) { g_last_err = -404; return false; }
+    return crsdk_connect_index(0) == 0;
+}
+
+// ====== ЗБЕРЕЖЕННЯ/КАДРИ ======
 bool crsdk_set_save_dir(rust::Str path_utf8) {
     if (!g_dev) { g_last_err = -3; return false; } // not connected
     CrError err = SCRSDK::SetSaveInfo(g_dev,
@@ -229,6 +268,7 @@ static std::string last_error_text_impl(int code) {
     if (code == 0) return "CrError_None";
     switch (code) {
         case -1001: return "Init failed";
+        case -404:  return "No cameras";
         case -2:    return "Invalid device index";
         case -3:    return "Not connected";
         case -110:  return "Capture timeout";
@@ -242,9 +282,7 @@ rust::String crsdk_last_error_text() {
 }
 
 std::uint32_t crsdk_version_raw() {
-    // CRSDK повертає номер версії як ціле (наприклад 11400 == 1.14.00)
-    return SCRSDK::GetSDKVersion();
+    return SCRSDK::GetSDKVersion(); // 11400 => 1.14.00
 }
-
 
 } // namespace sony
