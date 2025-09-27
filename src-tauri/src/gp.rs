@@ -1,53 +1,219 @@
-use std::{fs, path::PathBuf, process::Command, time::{SystemTime, UNIX_EPOCH}};
+// src-tauri/src/gp.rs
+// gphoto2-based capture helpers with robust error handling and concurrency guard.
 
-fn ts() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+use once_cell::sync::Lazy;
+use std::{
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+/// Global lock to serialize gphoto2 invocations (CLI tools dislike concurrency).
+static CAPTURE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+fn unix_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
-pub fn ensure_tool() -> Result<(), String> {
-    Command::new("gphoto2").arg("--version")
-        .status().map_err(|e| format!("gphoto2 not found: {e}"))?
-        .success().then_some(()).ok_or("gphoto2 failed to run".into())
-}
-
-pub fn auto_detect() -> Result<Vec<String>, String> {
-    let out = Command::new("gphoto2").arg("--auto-detect")
-        .output().map_err(|e| format!("detect failed: {e}"))?;
-    if !out.status.success() { return Err(format!("detect exit {}", out.status)); }
-    let s = String::from_utf8_lossy(&out.stdout);
-    let mut res = Vec::new();
-    // пропускаємо заголовок із тире
-    let mut sep_seen = false;
-    for line in s.lines() {
-        if !sep_seen { sep_seen = line.starts_with("---"); continue; }
-        let l = line.trim();
-        if !l.is_empty() { res.push(l.to_string()); }
-    }
-    Ok(res)
-}
-
-pub fn capture_to(dir: &str) -> Result<String, String> {
-    fs::create_dir_all(dir).map_err(|e| format!("mkdir: {e}"))?;
-    let t = ts();
-    let pattern = format!("{dir}/shot-{t}.%C");
-    let status = Command::new("gphoto2")
-        // зберігати на карту + скачати
-        .args(["--set-config", "capturetarget=1"])
-        .args(["--capture-image-and-download", "--force-overwrite", "--keep"])
-        .args(["--filename", &pattern])
-        // стабілізуємо локаль, щоб поведінка була передбачувана
+/// Run gphoto2 with LANG=C for predictable output.
+/// Generic over argument types to avoid lifetime issues with temporary Strings.
+fn run_gphoto<I, S>(args: I) -> Result<(i32, String, String), String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let out = Command::new("gphoto2")
+        .args(args)
         .env("LANG", "C")
-        .status().map_err(|e| format!("spawn gphoto2: {e}"))?;
-    if !status.success() { return Err(format!("gphoto2 exit status {status}")); }
+        .env("LC_ALL", "C")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("spawn gphoto2: {e}"))?;
 
-    // gphoto2 підставляє розширення у %C — знаходимо створений файл
-    let prefix = format!("shot-{t}.");
-    let mut found: Option<PathBuf> = None;
-    for e in fs::read_dir(dir).map_err(|e| format!("read_dir: {e}"))? {
-        let e = e.map_err(|e| e.to_string())?;
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) { found = Some(e.path()); break; }
+    let code = out.status.code().unwrap_or(-1);
+    let so = String::from_utf8_lossy(&out.stdout).to_string();
+    let se = String::from_utf8_lossy(&out.stderr).to_string();
+    Ok((code, so, se))
+}
+
+/// Ensure gphoto2 is available and works.
+pub fn ensure_tool() -> Result<(), String> {
+    use std::process::Stdio;
+    std::process::Command::new("gphoto2")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("gphoto2 not found: {e}"))?
+        .success()
+        .then_some(())
+        .ok_or("gphoto2 failed to run".into())
+}
+
+
+/// List cameras using `--auto-detect` (raw lines after the header).
+pub fn auto_detect() -> Result<Vec<String>, String> {
+    let (_c, so, _se) = run_gphoto(["--auto-detect"])?;
+    let mut sep = false;
+    let mut lines = Vec::new();
+    for line in so.lines() {
+        let trimmed = line.trim();
+        if !sep {
+            if trimmed.starts_with("---") {
+                sep = true;
+            }
+            continue;
+        }
+        if !trimmed.is_empty() {
+            lines.push(trimmed.to_string());
+        }
     }
-    let p = found.ok_or_else(|| "capture ok, але файл не знайдено".to_string())?;
-    Ok(p.to_string_lossy().to_string())
+    Ok(lines)
+}
+
+/// Try to set capturetarget to card if camera supports it. Best-effort.
+fn try_set_capture_target_card(port: Option<&str>) {
+    // This call uses only &str, so a simple Vec<&str> is fine:
+    let mut get_args = vec!["--get-config", "capturetarget"];
+    if let Some(p) = port {
+        get_args.extend(["--port", p]);
+    }
+    if let Ok((_c, so, _se)) = run_gphoto(get_args) {
+        // look for "Choice: N Memory card" variants
+        let desired = ["Memory card", "Card", "SD", "Memory card(1)"];
+
+        // collect "Choice: <idx> <label>" lines
+        let choices: Vec<(i32, String)> = so
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                if !l.starts_with("Choice:") {
+                    return None;
+                }
+                // Example: "Choice: 1 Memory card"
+                let mut parts = l.split_whitespace();
+                let _choice = parts.next()?; // "Choice:"
+                let idx_str = parts.next()?; // "1"
+                let rest = parts.collect::<Vec<_>>().join(" "); // "Memory card"
+                let idx = idx_str.parse::<i32>().ok()?;
+                Some((idx, rest))
+            })
+            .collect();
+
+        if let Some((idx, _)) = choices
+            .iter()
+            .find(|(_, label)| desired.iter().any(|d| label.to_lowercase().contains(&d.to_lowercase())))
+        {
+            // <-- IMPORTANT: build Vec<String> so we can include formatted value safely
+            let cfg = format!("capturetarget={idx}");
+            let mut set_args: Vec<String> = vec!["--set-config".into(), cfg];
+            if let Some(p) = port {
+                set_args.push("--port".into());
+                set_args.push(p.to_string());
+            }
+            let _ = run_gphoto(set_args);
+        }
+    }
+}
+
+/// Prefer human-displayable image if multiple files appeared (e.g. RAW+JPEG).
+fn prefer_displayable(files: &[PathBuf]) -> Option<&PathBuf> {
+    const DISPLAYABLE: &[&str] = &["jpg", "jpeg", "png"];
+    for ext in DISPLAYABLE {
+        if let Some(p) = files.iter().find(|p| {
+            p.extension()
+                .and_then(OsStr::to_str)
+                .map(|e| e.eq_ignore_ascii_case(ext))
+                .unwrap_or(false)
+        }) {
+            return Some(p);
+        }
+    }
+    files.first()
+}
+
+/// Capture to `save_dir`. If primary file is RAW-only, also try to produce preview JPEG.
+/// `port` is optional like "usb:001,005".
+pub fn capture_to(save_dir: &str, port: Option<&str>) -> Result<String, String> {
+    let _guard = CAPTURE_LOCK.lock().unwrap();
+
+    fs::create_dir_all(save_dir).map_err(|e| format!("mkdir: {e}"))?;
+    let t = unix_ts();
+    let file_prefix = format!("shot-{t}.");
+    let pattern = format!("{save_dir}/shot-{t}.%C");
+
+    // Try card target, but do not fail if unavailable
+    try_set_capture_target_card(port);
+
+    // Build args as Vec<String> because we include a formatted String.
+    let mut args: Vec<String> = vec![
+        "--capture-image-and-download".into(),
+        "--force-overwrite".into(),
+        "--keep".into(),
+        "--filename".into(),
+        pattern.clone(),
+    ];
+    if let Some(p) = port {
+        args.push("--port".into());
+        args.push(p.to_string());
+    }
+    let (code, _so, se) = run_gphoto(args)?;
+    if code != 0 {
+        return Err(format!("gphoto2 exit {code}: {se}"));
+    }
+
+    // Collect captured files with this timestamp-based prefix
+    let mut candidates: Vec<PathBuf> = fs::read_dir(save_dir)
+        .map_err(|e| format!("read_dir: {e}"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(OsStr::to_str)
+                .map(|n| n.starts_with(&file_prefix))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    candidates.sort();
+
+    if candidates.is_empty() {
+        return Err("capture succeeded, but file was not found".to_string());
+    }
+
+    let chosen = prefer_displayable(&candidates).cloned().unwrap();
+
+    // If chosen file is not displayable (e.g. RAW), try to create a preview for UI
+    let is_displayable = chosen
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png"))
+        .unwrap_or(false);
+
+    if !is_displayable {
+        let preview_path = format!("{save_dir}/shot-{t}.preview.jpg");
+        let mut preview_args: Vec<String> = vec![
+            "--capture-preview".into(),
+            "--force-overwrite".into(),
+            "--filename".into(),
+            preview_path.clone(),
+        ];
+        if let Some(p) = port {
+            preview_args.push("--port".into());
+            preview_args.push(p.to_string());
+        }
+        if let Ok((c, _so, _se)) = run_gphoto(preview_args) {
+            if c == 0 && Path::new(&preview_path).exists() {
+                return Ok(preview_path);
+            }
+        }
+    }
+
+    Ok(chosen.to_string_lossy().to_string())
 }
