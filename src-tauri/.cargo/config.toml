@@ -1,6 +1,0 @@
-# macOS
-[target.aarch64-apple-darwin]
-rustflags = ["-C","link-args=-Wl,-rpath,@executable_path/../.."]
-
-[target.x86_64-apple-darwin]
-rustflags = ["-C","link-args=-Wl,-rpath,@executable_path/../.."]
